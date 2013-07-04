@@ -1,0 +1,15 @@
+#!/bin/bash
+SYSROOT="${SYSROOT:-/usr/armv6j-hardfloat-linux-gnueabi/}"
+CBUILD=$(portageq envvar CHOST)
+PORTAGE_CONFIGROOT="$SYSROOT"
+if [[ "$1" == "--root" ]] ; then
+    ROOT="$2"
+    shift 2
+else
+    ROOT="$SYSROOT"
+fi
+PKGDIR=${ROOT}packages/
+PORTAGE_TMPDIR=${ROOT}tmp/
+export CBUILD PORTAGE_CONFIGROOT ROOT SYSROOT PKGDIR PORTAGE_TMPDIR
+emerge $*
+unset CBUILD PORTAGE_CONFIGROOT ROOT SYSROOT PKGDIR PORTAGE_TMPDIR

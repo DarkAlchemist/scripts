@@ -1,0 +1,258 @@
+#!/bin/bash
+
+# This script wraps around lxc-gentoo to add a few extra features for Virtual Ethernet Pairs to work correctly
+
+# Example Commands:
+# NAME only affects the name of the veth device and the container folder, we'll fix this with sed afterwards!
+# Default password is currently 'toor'
+# UTSNAME is the hostname
+# GATEWAY="10.0.0.1" NAME="gentoo" UTSNAME="gentoo-lxc-1" ./lxc-gentoo -i 10.0.0.2/24 -q
+# GATEWAY="10.0.0.1" NAME="gentoo" UTSNAME="gentoo-lxc-1" ./lxc-gentoo -i 10.0.0.2/24 -q
+
+LIBDIR="/usr/local/lib"
+SBINDIR="/usr/local/sbin"
+source ${STDLIB:-$LIBDIR/stdlib.sh}
+source ${TICKTICK:-$LIBDIR/ticktick.sh}
+
+LXCROOT="${LXCROOT:-/var/lib/lxc}"
+
+# Should be used in conjunction with the lxc-gentoo script and ticktick for JSON parsing!
+LXCGENTOO="${SBINDIR}/lxc-gentoo"
+NETUPSCRIPT="/usr/local/sbin/host-net-up"
+
+function getHostConfiguration(){
+	local searchname="$1" 
+	local config="$2"
+	# Read in mounts data and parse it
+	local DATA=`cat $config`
+	tickParse "$DATA"
+	
+	for host in ``.hosts[*]``; 
+	do
+		hostname=``hosts[$host].hostname``
+		if $( echo "$hostname" | grep -E "^$searchname$" >/dev/null ) ; then
+			host_type=``hosts[$host].host_type``
+			if [[ "$host_type" != "lxc" ]]; then 
+				break
+			fi
+			for aliaskey in ``hosts[$host].aliases[!]``
+			do
+				# We only take the first alias as we want to use it as a config name
+				if [[ -z "$alias" ]] ; then
+					alias=``hosts[$host].aliases[$aliaskey]``
+				fi
+			done
+			for interface in ``hosts[$host].interfaces[!]``
+			do	
+				if [[ -z "$guest_ip" ]] ; then	
+					guest_ip=``hosts[$host].interfaces[$interface].ip``
+					guest_subnet=``hosts[$host].interfaces[$interface].subnet``
+					guest_gateway=``hosts[$host].interfaces[$interface].gateway``
+					guest_interface=``hosts[$host].interfaces[$interface].interface``
+					type=``hosts[$host].interfaces[$interface].type``
+					if [[ "$type" = "veth_pair" ]] ; then
+						host_ip=``hosts[$host].interfaces[$interface].veth_options.host_ip``
+						host_subnet=``hosts[$host].interfaces[$interface].veth_options.host_subnet``
+						host_interface=``hosts[$host].interfaces[$interface].veth_options.host_interface``
+						FORWARD_PORTS=()
+						for port_key in ``hosts[$host].interfaces[$interface].veth_options.forward_ports[!]``
+						do
+							port=``hosts[$host].interfaces[$interface].veth_options.forward_ports[$port_key]``
+							FORWARD_PORTS+=( "$port" )
+						done
+					fi
+					break
+				fi
+			done
+			GATEWAY="$guest_gateway"
+			GUESTIP="$guest_ip$guest_subnet"
+			GUESTIF="$guest_interface"
+			HOSTIF="$host_interface"
+			HOSTIP="$host_ip$host_subnet"
+			NAME="$hostname"
+			UTSNAME="$hostname"
+		fi
+	done
+	if [[ -z "$guest_ip" ]] ; then
+		echo >&2 "ERROR: Hostname specified was not found"
+		exit 1
+	fi
+	if [[ -z "$host_ip" ]] ; then
+		echo >&2 "ERROR: Only Veth Pairs are supported for AutoConfig currently"
+		exit 1
+	fi
+}
+
+function getDefaultConfiguration(){
+	# These are all the defaults, overrideable via command line or using a JSON file
+	GATEWAY=${GUESTGATEWAY:-"10.0.0.1"}
+	# IP of the container
+	GUESTIP=${GUESTIP:-"10.0.0.2/24"}
+	# Interface name inside the container on the host
+	GUESTIF=${GUESTIF:-"eth0"}
+	# IP of the interface on the host
+	HOSTIP=${HOSTIP:-"10.1.0.2/32"}
+	# Interface name for this container on the host
+	HOSTIF=${HOSTIF:-"veth0"}
+	# Name used for folder
+	NAME=${NAME:-"gentoo"}
+	# Hostname and name for config
+	UTSNAME=${UTSNAME:-"gentoo"}
+}
+
+function runLXCGentoo(){
+	NETUPSCRIPT="$NETUPSCRIPT" HOSTIF="$HOSTIF" SUBARCH="amd64" GATEWAY="$GATEWAY" NAME="$NAME" UTSNAME="$UTSNAME" $LXCGENTOO create -i $GUESTIP -q
+}
+
+function generateNetworkScripts(){
+	local rootfs=$1
+
+	# Generate networking scripts for both guest and host
+	HOSTIPONLY=$( echo "$HOSTIP" | cut -d'/' -f 1 )
+	GUESTIPONLY=$( echo "$GUESTIP" | cut -d'/' -f 1 )
+	GUESTSUBNET="$( echo "$GUESTIPONLY" | cut -d'.' -f 1-3 ).0"
+	HOSTEXTIP=$( getIPAddr "eth0" )
+	HOSTIFSCRIPT="${rootfs}${NETUPSCRIPT}"
+	GENTOONETWORKSCRIPT="${rootfs}/etc/conf.d/net"
+	mkdir -p "$( dirname "$HOSTIFSCRIPT" )"
+
+	cat <<-EOF > "$HOSTIFSCRIPT"
+		#!/bin/bash
+
+		# Set up peering with the container interface
+		ip addr add dev $HOSTIF $HOSTIP peer $GUESTIP
+
+		# Make sure IP forwarding is enabled
+		echo 1 > /proc/sys/net/ipv4/ip_forward
+
+		# Enable source natting for traffic to outbound network
+		if ! \`iptables -t nat -C POSTROUTING -s $GUESTIPONLY/32 -o eth0 -j SNAT --to-source $HOSTEXTIP -m comment --comment "Access for $NAME outbound"\` ; then
+			iptables -t nat -A POSTROUTING -s $GUESTIPONLY/32 -o eth0 -j SNAT --to-source $HOSTEXTIP -m comment --comment "Access for $NAME outbound"
+		fi
+
+		# Enable routing to this VM for hosts looking for it ( e.g. other lxc on this host )
+		route add -host ${GUESTIPONLY}/32 gw $HOSTIPONLY dev $HOSTIF
+	EOF
+
+	chmod +x "$HOSTIFSCRIPT"
+	cat <<EOF > "$GENTOONETWORKSCRIPT"
+config_eth0="noop"
+
+postup() {
+	if  [[ \${IFACE} == "$GUESTIF" ]]; then 
+		ip addr add dev $GUESTIF $GUESTIP peer $HOSTIP
+		# Deletes default route
+		ip route del 2>/dev/null
+		# Delete subnet just in case
+		ip route del $GUESTSUBNET/24
+		
+		# Add default route
+		ip route add default via $HOSTIPONLY metric 100
+	fi
+}
+EOF
+	port_len=${#FORWARD_PORTS[@]}
+	if [[ $port_len > 0 ]] ; then
+		for (( i=0; i < ${port_len}; i++ ))
+		do
+			port="${FORWARD_PORTS[$i]}"
+			cat <<-EOF >> "$HOSTIFSCRIPT"
+				if ! \`iptables -t nat -C PREROUTING -p tcp -d $HOSTEXTIP --dport $port -j DNAT --to-destination $GUESTIPONLY -m comment --comment "Forward port $port to $NAME"\`; then
+				        iptables -t nat -A PREROUTING -p tcp -d $HOSTEXTIP --dport $port -j DNAT --to-destination $GUESTIPONLY -m comment --comment "Forward port $port to $NAME"
+				fi
+				if ! \`iptables -t nat -C OUTPUT -p tcp -d $HOSTEXTIP --dport $port -j DNAT --to-destination $GUESTIPONLY -m comment --comment "Forward port $port to $NAME"\`; then
+				        iptables -t nat -A OUTPUT -p tcp -d $HOSTEXTIP --dport $port -j DNAT --to-destination $GUESTIPONLY -m comment --comment "Forward port $port to $NAME"
+				fi
+			EOF
+		done
+	fi
+}
+
+function installPackages(){
+	# Prepare filesystem with the relevant packages
+	if [[ -n "$PORTAGE_BINHOST" ]] ; then
+		binhostMerge "${ROOTFS}" "vim iproute2" "$PORTAGE_BINHOST"
+	else
+		execInChroot "${ROOTFS}" "emerge vim iproute2 net-misc/telnet-bsd --quiet-build"
+	fi
+}
+
+function postInstallTweaks(){
+	if [[ -n "${ROOTFS}" && -n "${GUESTIF}" ]] ; then
+		execInChroot "${ROOTFS}" "ln -sr /etc/init.d/net.lo /etc/init.d/net.$GUESTIF"
+		execInChroot "${ROOTFS}" "rc-update add net.$GUESTIF default"
+		execInChroot "${ROOTFS}" "rc-update add sshd default"
+	fi
+}
+
+function binhostMerge(){
+	local root="$1"
+	local packages="$2"
+	local binhost="$3"
+	if [[ -n "$binhost" ]] ; then
+		PORTAGE_BINHOST="$binhost" emerge --root=$root --config-root=$root $packages -Gv --quiet-build
+	else
+		emerge --root=$root --config-root=$root $packages -v --quiet-build
+	fi
+}
+
+# This function creates an LXC container from scratch
+function create(){
+	if [[ -f "$CONFIG" && -n "$SEARCHNAME" ]] ; then
+		getHostConfiguration "$SEARCHNAME" "$CONFIG"
+	else
+		getDefaultConfiguration
+	fi
+	runLXCGentoo
+	if [[ $? -ne 0 ]] ; then
+		echo >&2 "ERROR: Could not create container"
+		exit 1 
+	fi
+
+	ROOTFS="$LXCROOT/$NAME/rootfs"
+
+	generateNetworkScripts "$ROOTFS"
+
+	installPackages
+
+	postInstallTweaks
+
+	# On Ubuntu hosts only for now
+	if `uname -a | grep -i ubuntu > /dev/null` ; then
+		ln -sn "${LOCATION}/${UTSNAME}.conf" /etc/lxc/auto/ 
+	fi
+}
+
+function updateNetworking(){
+	getHostConfiguration "$SEARCHNAME" "$CONFIG"
+	
+	ROOTFS="$LXCROOT/$SEARCHNAME/rootfs"
+	CONFFILE="${CONFFILE:-$LXCROOT/$SEARCHNAME/config}"	
+
+	sed -i 's|lxc.network.ipv4 =.*|lxc.network.ipv4 = '$GUESTIP'|g' "$CONFFILE"
+	sed -i 's|lxc.network.script.up =.*|lxc.network.script.up = '$ROOTFS$NETUPSCRIPT'|g' "$CONFFILE"
+	generateNetworkScripts "$ROOTFS"
+}
+
+MODE="$1"
+if ! `echo "$MODE" | grep "\-\-" >/dev/null` ; then
+	echo >&2 "ERROR: Mode not specified!"
+	exit 1
+fi
+shift 1
+# General options for the script
+while getopts ":c:n:b:o:" opt; do
+	case $opt in
+		c)	CONFIG="$OPTARG" ;;
+		n)	SEARCHNAME="$OPTARG" ;;
+		b)	PORTAGE_BINHOST="$OPTARG" ;;
+		o)	OS="$OPTARG" ;;
+	esac
+done
+
+case $MODE in
+	--create) 		create ;;
+	--update-networking) 	updateNetworking ;;	
+	--clone)		exit 1;;
+	*)			echo >&2 "ERROR: Invalid mode specified!" && exit 1 ;;
+esac

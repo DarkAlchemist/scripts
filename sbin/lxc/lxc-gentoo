@@ -1,0 +1,864 @@
+#!/bin/bash
+
+###############################################################################
+#
+#  lxc-gentoo : script to create a gentoo lxc guest
+#  
+#   license: 
+#     This program is free software: you can redistribute it and/or modify
+#     it under the terms of the GNU General Public License as published by
+#     the Free Software Foundation, either version 3 of the License, or
+#     (at your option) any later version.
+#  
+#     This program is distributed in the hope that it will be useful,
+#     but WITHOUT ANY WARRANTY; without even the implied warranty of
+#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#     GNU General Public License for more details.
+#  
+#     You should have received a copy of the GNU General Public License
+#     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#   requires:
+#    - lxc-utils package
+#    - linux kernel with relevant options enabled (see lxc-checkconfig)
+#    - wget and a working internet connection for HTTP fetches
+#
+#   output environment description:
+#    - uses the latest stage3 and portage (ie: 'very latest gentoo')
+#    - creates a veth-connected guest
+#       - a virtual ethernet interface appears to the guest as 'eth0' and the
+#         host as '<guestname>' (max 15 characters; less show on 'ifconfig')
+#       - can optionally be bridged via bridge-utils 
+#       - a bridge is like a software-switch interface on the host and
+#         requires some host configuration, eg:
+#          # install bridge utils package, eg: on gentoo 'emerge bridge-utils'
+#          brctl addbr br0              # create bridge
+#          brctl setfd br0 0            # set forward delay to 0 seconds
+#          ifconfig br0 172.20.0.1      # set an IP for the bridge
+#          brctl addif br0 <guestname>  # add guest to bridge
+#          # ...iptables SNAT stuff...
+#    - guests can be altered to otherwise use a physical interface, vlan, etc.
+#    - typical startup time is 0.2-2 seconds
+#    - very fast disk IO (unlike paravirtualised solutions)
+#   
+#   notes:
+#    - dedicated to all fellow ethical unix hackers who do not work for 
+#      morally corrupt governments and corporations: use your powers for good!
+#
+#   authors: Fedja Beader, Anders Larsson, Julien Sanchez, Walter Stanish,
+#            Guillaume Zitta, and others.
+#
+###############################################################################
+
+CACHE=${CACHE:-/var/cache/lxc/gentoo}
+alias wget="wget --timeout=8 --read-timeout=15 -c -t10 -nd"
+
+# Defaults only
+NAME=${NAME:-gentoo}
+UTSNAME=${UTSNAME:-gentoo}
+IPV4=${IPV4:-172.20.0.2/24}
+GATEWAY=${GATEWAY:-172.20.0.1}
+HOSTIF=${HOSTIF:-veth0}
+GUESTROOTPASS="$GUESTROOTPASS"
+LXCROOT=${LXCROOT:-/var/lib/lxc}
+NETUPSCRIPT="$NETUPSCRIPT"
+if [ `uname -m` == "x86_64" ]; then
+	ARCH=${ARCH:-amd64}
+	SUBARCH=${SUBARCH:-amd64}
+else
+	ARCH=${ARCH:-x86}
+	SUBARCH=${SUBARCH:-$(uname -m)}
+fi
+ARCHVARIANT=${ARCHVARIANT:-}
+CONFFILE="${CONFFILE:-$LXCROOT/$NAME/config}"
+MIRROR=${MIRROR:-http://distfiles.gentoo.org}
+STAGE3_TARBALL="${STAGE3_TARBALL}"
+PORTAGE_SOURCE="$PORTAGE_SOURCE"
+
+# These paths are within the container so do not need to obey configure prefixes
+INITTAB="/etc/inittab"
+FSTAB="/etc/fstab"
+
+# Ensure strict root's umask doesen't render the VM unusable
+umask 022
+
+################################################################################
+#                        Various helper functions
+################################################################################
+
+# param: $1: the name of the lock
+# The rest contain the command to execute and its parameters
+execute_exclusively()
+{
+	mkdir -p /var/lock/subsys
+
+	local lock_name="$1"
+	shift 1
+
+	{
+		printf "Attempting to obtain an exclusive lock (timeout: 30 min) named \"%s\"...\n" "$lock_name"
+
+		printf -v time_started "%(%s)T" "-1"
+		flock -x -w 1800  50
+
+		if [[ $? -ne 0 ]]; then
+			printf " => unable to obtain after %s seconds, aborting.\n" "$(($(printf "%(%s)T" "-1") - $time_started))"
+			return 2
+		else
+			printf " => done, took %s seconds.\n" "$(($(printf "%(%s)T" "-1") - $time_started))"
+		fi
+
+		printf " => Executing \"%s\"\n" "$*"
+		"$@"
+
+	} 50> "/var/lock/subsys/$lock_name"
+}
+
+# Please use these suggested error codes:
+# die 1 ... -- general/unspecified failure
+# die 2 ... -- filesystem error (e.g. tar unpacking failed)
+# die 4 ... -- network error
+# die 8 ... -- error in program logic
+# die 16 .. -- erroneous (user) input
+# or any combination of these.
+
+die()
+{
+	printf "\n[the last exit code leading to this death was: %s ]\n" "$?"
+	local retval="$1"
+	shift 1
+	printf "$@"
+	exit "$retval"
+}
+
+################################################################################
+#                    DISTRO custom configuration files
+################################################################################
+
+populate_dev()
+{
+	cd "$ROOTFS/dev" || die 2 "Unable to change directory to %s!\n" "$ROOTFS/dev"
+
+	# we silence errors as newer stage3s already include needed device files
+	{
+		# newer stage3 include too many useless nodes, remove them
+		rm -f hda*
+		rm -f sda*
+		rm -f sdb*
+		rm -f sdc*
+		rm -f sdd*
+		rm -f tty*
+		rm -f core
+		rm -f mem
+		rm -f port
+		rm -rf input/
+
+		# tabsize 4
+		mknod -m 666 null		c 1 3
+		mknod -m 666 zero		c 1 5
+		mknod -m 666 full		c 1 7
+
+		mknod -m 666 random		c 1 8
+		mknod -m 666 urandom	c 1 9
+
+		mknod -m 600 console	c 5 1
+		mknod -m 666 tty		c 5 0
+		mknod -m 666 tty0		c 4 0
+		mknod -m 666 tty1		c 4 1
+
+		mknod -m 600 initctl	p
+
+		mknod -m 666 ptmx		c 5 2
+		mkdir -m 755 pts
+
+		mkdir -m 1777 shm
+
+		mkdir -m 755 net
+		mknod -m 666 net/tun	c 10 200
+
+	} 2> /dev/null
+	cd - > /dev/null
+}
+
+# custom fstab
+write_distro_fstab()
+{
+	cat <<- EOF > ${ROOTFS}/${FSTAB}
+	# required to prevent boot-time error display
+	none    /         none    defaults  0 0
+	tmpfs   /dev/shm  tmpfs   defaults  0 0
+	EOF
+}
+
+write_distro_timezone()
+{
+	if [ -e /etc/localtime ]; then
+		# duplicate host timezone
+		cat /etc/localtime > ${ROOTFS}/etc/localtime
+	else
+		# otherwise set up UTC
+		rm ${ROOTFS}/etc/localtime > /dev/null 2>&1
+		ln -s ../usr/share/zoneinfo/UTC ${ROOTFS}/etc/localtime
+	fi
+}
+
+# custom inittab
+write_distro_inittab()
+{
+	sed -i 's/^c[1-9]/#&/' ${ROOTFS}/${INITTAB} # disable getty
+	echo "# Lxc main console" >> ${ROOTFS}/${INITTAB}
+	echo "1:12345:respawn:/sbin/agetty -a root --noclear 115200 console linux" >> "$ROOTFS/$INITTAB"
+	# we also blank out /etc/issue here in order to prevent delays spawning login
+	# caused by attempts to determine domainname on disconnected containers
+	rm ${ROOTFS}/etc/issue && touch ${ROOTFS}/etc/issue
+	# we also disable the /etc/init.d/termencoding script which can cause errors
+	sed -i 's/^(\s*keyword .*)$/$1 -lxc/' ${ROOTFS}/etc/init.d/termencoding
+	# quiet login
+	touch ${ROOTFS}/root/.hushlogin
+}
+
+setup_portage()
+{
+	# do a primitive portage setup
+	mkdir -p "$ROOTFS/etc/portage" && \
+	mkdir -p "$ROOTFS/var/portage/tmp" && \
+	mkdir -p "$ROOTFS/var/portage/tree" && \
+	mkdir -p "$ROOTFS/var/portage/logs" && \
+	mkdir -p "$ROOTFS/var/portage/packages" && \
+	mkdir -p "$ROOTFS/var/portage/distfiles" \
+		|| die 2 "Error: unable to create needed portage directories.\n"
+
+	# relocate profile symlink
+	local src="$ROOTFS/etc/portage/make.profile"
+	local dest="$(readlink "$src")"
+	dest="${dest##*../}"
+	dest="${dest//usr\/portage/var/portage/tree}"
+	# In lieu of being able to create relative symlinks...
+#	dest="$ROOTFS/$dest"
+	dest="../../$dest"
+	ln -f -s "$dest" "$src" \
+		|| die 2 "Error: unable to relocate portage symlink:\n%s -> %s\n" "$src" "$dest"
+
+	cat <<- EOF >> "$ROOTFS/etc/portage/make.conf"
+	PORTAGE_TMPDIR="/var/portage/tmp"
+	PORTDIR="/var/portage/tree"
+	PORT_LOGDIR="/var/portage/logs"
+	PKGDIR="/var/portage/packages"
+	DISTDIR="/var/portage/distfiles"
+
+	# enable this to store built binary packages
+	#FEATURES="\$FEATURES buildpkg"
+
+	FEATURES="\$FEATURES compress-build-logs"
+	FEATURES="\$FEATURES split-log"
+	FEATURES="\$FEATURES split-elog"
+	EOF
+
+	if [[ "$PORTAGE_SOURCE" == "none" ]]; then
+		printf "Skipping portage tree setup\n"
+	else
+		# We need to set up the portage tree
+		if [[ -z "$PORTAGE_SOURCE" ]]; then
+			execute_exclusively "portage" fetch_portage \
+				|| die 1 "Error: unable to fetch a portage snapshot.\n"
+		fi
+
+		# PORTAGE_SOURCE will be set by fetch_portage.
+		if [[ -f "$PORTAGE_SOURCE" ]]; then
+			printf "Extracting the portage tree into %s/var/portage/tree...\n" "$ROOTFS"
+			tar -xp --strip-components 1 -C "$ROOTFS/var/portage/tree/" -f "$PORTAGE_SOURCE" \
+				|| die 2 "Error: unable to extract the portage tree.\n"
+		elif [[ -d "$PORTAGE_SOURCE" ]]; then
+			printf "Will bind mount the portage tree from the host (%s).\n" "$PORTAGE_SOURCE"
+		else
+			printf "Warning: I don't know what to do with this portage source (%s)\n" "$PORTAGE_SOURCE"
+		fi
+	fi
+}
+
+# custom network configuration
+write_distro_network()
+{
+	# /etc/resolv.conf
+	grep -i 'search ' /etc/resolv.conf > ${ROOTFS}/etc/resolv.conf
+	grep -i 'nameserver ' /etc/resolv.conf >> ${ROOTFS}/etc/resolv.conf
+	# Append LXC-specific gentoo network configuration instructions
+	cat <<- EOF >> "$ROOTFS/etc/conf.d/net"
+
+		# =================
+		# LXC CONFIGURATION
+		# =================
+		# eth0 (lxc virtualised network adapter)
+		#  optionally can be bridged.
+		#     - host br0 is managed with the bridge-utils package, ie:
+		#        brctl addbr br0
+		#        brctl setfd br0 0
+		#        ifconfig br0 172.20.0.1
+		#       ... or, on a gentoo host run:
+		#        # create init script
+		#        cd /etc/init.d && ln -s net.lo net.br0
+		#        # specify configuration
+		#        echo 'config_br0=( "172.20.0.1 netmask 255.255.0.0" )'>>/etc/conf.d/net
+		#        echo 'brctl_br0=( "setfd 0" "sethello 10" "stp off" )'>>/etc/conf.d/net
+		#        # bring up interface
+		#        /etc/init.d/net.br0 up
+		#        # set interface to start on boot
+		#        rc-update add net.br0 default
+		#
+		#     - host grants connectivity using iptables, eg:
+		#        EXTIF=eth0 # internet facing interface on the host
+		#        IP=\`ifconfig \$EXTIF|grep 'inet addr'|cut -d':' -f2|cut -d' ' -f1\`
+		#        iptables -t nat -A POSTROUTING -o \$EXTIF \\ 
+		#         -j SNAT --to-source \$IP
+		#       ... on a gentoo host, assuming external interface IP remains static
+		#           between reboots, then after running the above execute:
+		#             /etc/init.d/iptables save
+		#             rc-update add iptables default
+	EOF
+	# only link for dchp, since static options render it unnecessary
+	# https://github.com/globalcitizen/lxc-gentoo/issues/33
+	if [ "${IPV4}" == "dhcp" ]; then
+	 ln -s net.lo ${ROOTFS}/etc/init.d/net.eth0
+	 ln -s /etc/init.d/net.eth0 ${ROOTFS}/etc/runlevels/default/net.eth0
+	fi
+}
+
+# custom hostname
+write_distro_hostname()
+{
+	echo -n " - setting hostname..."
+	cat <<- EOF > ${ROOTFS}/etc/conf.d/hostname
+	HOSTNAME=${UTSNAME}
+	EOF
+	echo "done."
+}
+
+# fix init system
+write_distro_init_fixes()
+{
+	# short-circuit openrc's autodetection
+	sed 's/^#rc_sys=""/rc_sys="lxc"/g' -i ${ROOTFS}/etc/rc.conf
+	# fix for error caused by openrc <0.10.2 (~may 2012)
+	rm ${ROOTFS}/etc/runlevels/boot/termencoding >/dev/null 2>&1
+	# fix boot-time interface config wipe under aggressive cap drop
+	# (openrc 0.9.8.4 ~sep 2012 - https://bugs.gentoo.org/show_bug.cgi?id=436266)
+	sed -i -e 's/^#rc_nostop=""/rc_nostop="net.eth0 net.lo"/' ${ROOTFS}/etc/rc.conf
+	# remove netmount from default runlevel (openrc leaves it in)
+	rm ${ROOTFS}/etc/runlevels/default/netmount
+	# remove urandom from boot runlevel (openrc<0.11 leaves it in ~sep 2012)
+	# https://bugs.gentoo.org/show_bug.cgi?id=436270
+	rm ${ROOTFS}/etc/runlevels/boot/urandom
+	# remove net.lo from boot runlevel (~jan 2013; openrc-0.11.8)
+	rm ${ROOTFS}/etc/runlevels/boot/net.lo
+	# unless we are using DHCP to configure the container, we now
+	# force openrc to automatic provision of the 'net' dep. this is
+	# avoided for DHCP as it would prohibit service start from waiting
+	# until the interface has been provided with an IP address, causing
+	# many daemon start issues such as failed binds / bad connectivity
+	# (~jan 2013)
+	if [ "${IPV4}" != "dhcp" ]; then
+		echo 'rc_provide="net"' >>${ROOTFS}/etc/rc.conf
+	fi
+}
+
+################################################################################
+#                        lxc configuration files
+################################################################################
+
+write_lxc_configuration()
+{
+	echo -n " - writing LXC guest configuration..."
+	cat <<- EOF > ${CONFFILE}
+	# set arch
+	lxc.arch = ${LXC_ARCH}
+
+	# set the hostname
+	lxc.utsname = ${UTSNAME}
+
+	# network interface
+	lxc.network.type = veth
+	lxc.network.flags = up
+	# - name in host (max 15 chars; defaults to 'tun'+random)
+	lxc.network.veth.pair = ${HOSTIF}
+	# - name in guest
+	lxc.network.name = eth0
+	# enable for bridging
+	# (eg. 'brctl addbr br0; brctl setfd br0 0; brctl addif br0 eth0')
+	#lxc.network.link = br0
+	EOF
+
+	if [ "${IPV4}" == "dhcp" ]; then
+		cat <<- EOF >> ${CONFFILE}
+		# disabled (guest uses DHCP)
+		#lxc.network.ipv4 = X.X.X.X
+		#lxc.network.ipv4.gateway = Y.Y.Y.Y
+		EOF
+	else
+		cat <<- EOF >> ${CONFFILE}
+		lxc.network.ipv4 = ${IPV4}
+		# This breaks the compatibility on older versions of LXC
+		# lxc.network.ipv4.gateway = ${GATEWAY}
+		EOF
+	fi
+
+	if [[ -n "$NETUPSCRIPT" ]] ; then
+		cat <<- EOF >> ${CONFFILE}
+		lxc.network.script.up = ${ROOTFS}${NETUPSCRIPT}
+		EOF
+	fi
+
+	cat <<- EOF >> ${CONFFILE}
+
+	# root filesystem location
+	lxc.rootfs = `readlink -f ${ROOTFS}`
+
+	# mounts that allow us to drop CAP_SYS_ADMIN
+	lxc.mount.entry=proc `readlink -f ${ROOTFS}/proc` proc nodev,noexec,nosuid 0 0
+	lxc.mount.entry=sys `readlink -f ${ROOTFS}/sys` sysfs defaults 0 0
+	lxc.mount.entry=shm `readlink -f ${ROOTFS}/dev/shm` tmpfs rw,nosuid,nodev,noexec,relatime 0 0
+	lxc.mount.entry=tmp `readlink -f ${ROOTFS}/tmp` tmpfs rw,nosuid,nodev,noexec 0 0
+	lxc.mount.entry=run `readlink -f ${ROOTFS}/run` tmpfs rw,nosuid,nodev,relatime,mode=755 0 0
+
+	EOF
+
+	if [[ -d "$PORTAGE_SOURCE" ]]; then
+		printf "lxc.mount.entry=%s var/portage/tree none ro,bind 0 0\n" "$PORTAGE_SOURCE" >> "$CONFFILE"
+	fi
+
+	cat <<- EOF >> "$CONFFILE"
+
+	# console access
+	lxc.tty = 1
+	lxc.pts = 128
+
+	# this part is based on 'linux capabilities', see: man 7 capabilities
+	#  eg: you may also wish to drop 'cap_net_raw' (though it breaks ping)
+	#
+	# WARNING: the security vulnerability reported for 'cap_net_admin' at
+	# http://mainisusuallyafunction.blogspot.com/2012/11/attacking-hardened-linux-systems-with.html
+	# via JIT spraying (the BPF JIT module disabled on most systems was used
+	# in the example, but others are suggested vulnerable) meant that users
+	# with root in a container, that capability and kernel module may escape
+	# the container. ALWAYS be extremely careful granting any process root
+	# within a container, use a minimal configuration at all levels -
+	# including the kernel - and multiple layers of security on any system
+	# where security is a priority.  note that not only LXC but PAX (and 
+	# others?) were vulnerable to this issue.
+	# 
+	# conservative: lxc.cap.drop = sys_module mknod mac_override sys_boot
+	# aggressive follows. (leaves open: chown dac_override fowner ipc_lock kill lease net_admin net_bind_service net_broadcast net_raw setgid setuid sys_chroot)
+	lxc.cap.drop = audit_control audit_write dac_read_search fsetid ipc_owner linux_immutable mac_admin mac_override mknod setfcap sys_admin sys_boot sys_module sys_pacct sys_ptrace sys_rawio sys_resource sys_time sys_tty_config
+
+	# deny access to all devices by default, explicitly grant some permissions
+	#
+	# format is [c|b] [major|*]:[minor|*] [r][w][m]
+	#            ^     ^                   ^
+	# char/block -'     \`- device number    \`-- read, write, mknod
+	#
+	# first deny all...
+	lxc.cgroup.devices.deny = a
+	# /dev/null and zero
+	lxc.cgroup.devices.allow = c 1:3 rw
+	lxc.cgroup.devices.allow = c 1:5 rw
+	# /dev/{,u}random
+	lxc.cgroup.devices.allow = c 1:9 rw
+	lxc.cgroup.devices.allow = c 1:8 r
+	# /dev/pts/*
+	lxc.cgroup.devices.allow = c 136:* rw
+	lxc.cgroup.devices.allow = c 5:2 rw
+	# /dev/tty{0,1}
+	lxc.cgroup.devices.allow = c 4:1 rwm
+	lxc.cgroup.devices.allow = c 4:0 rwm
+	# /dev/tty
+	lxc.cgroup.devices.allow = c 5:0 rwm
+	# /dev/console
+	lxc.cgroup.devices.allow = c 5:1 rwm
+	# /dev/net/tun
+	lxc.cgroup.devices.allow = c 10:200 rwm
+
+	EOF
+	echo "done."
+}
+
+set_guest_root_password()
+{
+	[[ -z "$GUESTROOTPASS" ]] && return # pass is empty, abort
+
+	echo -n " - setting guest root password.."
+	echo "root:$GUESTROOTPASS" | chroot ${ROOTFS} chpasswd
+	echo "done."
+}
+
+fetch_stage3()
+{
+	# prepend '-' to nonblank ARCHVARIANT for URL construction
+	local archvariant="${ARCHVARIANT:+-$ARCHVARIANT}"
+
+	# base stage3 URL
+	local stage3url="$MIRROR/releases/$ARCH/autobuilds"
+
+	# get latest-stage3....txt file for subpath
+	mkdir -p "$CACHE"
+	local stage3latestSubPathUrl="$stage3url/latest-stage3-${SUBARCH}${archvariant}.txt"
+
+	printf "Determining path to latest Gentoo %s%s stage3 archive...\n" "$ARCH" "$archvariant"
+	printf " => downloading and processing %s\n" "$stage3latestSubPathUrl"
+
+	local -a array_of_words
+	array_of_words=($(wget -q -O - "$stage3latestSubPathUrl")) \
+		|| die 6 "Error: unable to fetch\n"
+
+	# take the last word and convert it to string form:
+	latest_stage3_subpath="${array_of_words[-1]}"
+	printf " => Got: %s\n" "$latest_stage3_subpath"
+
+
+	# Download the actual stage3
+	local output_file="$CACHE/stage3-$ARCH-$latest_stage3_subpath"
+	if [[ -f "$output_file" ]]; then
+		printf "Skipping download of stage3 as it is already present.\n"
+	else
+		printf "Downloading the actual stage3 tarball...\n"
+
+		#  - ensure output directory exists
+		local output_dir="${output_file%/*}"
+		mkdir -p "$output_dir"
+
+		#  - grab
+		local input_url="$stage3url/$latest_stage3_subpath"
+		printf " => %s ...\n" "$input_url"
+
+		wget -O "$output_file" "$input_url" \
+			|| die 6 "Error: unable to fetch\n"
+		printf " => saved to: %s\n" "$output_file"
+	fi
+
+	# used by calling function
+	STAGE3_TARBALL="$output_file"
+}
+
+fetch_portage()
+{
+	local url="$MIRROR/snapshots/portage-latest.tar.bz2"
+	local dest="$CACHE/portage-latest.tar.bz2"
+
+	mkdir -p "$CACHE"
+	if [[ ! -f "$dest" ]]; then
+		# don't update
+		printf "Downloading Gentoo portage (software build database) snapshot...\n"
+
+		wget -O "$dest" "$url" \
+			|| die 6 "Error: unable to fetch\n"
+
+		printf " => done.\n"
+	fi
+
+	# used by calling function
+	PORTAGE_SOURCE="$dest"
+}
+
+configure()
+{
+	if [[ -z ${QUIET} ]]; then
+		# choose a container name, default is already in shell NAME variable
+		read -p "What is the name for the container (recommended <=15 chars)? " -ei "$NAME" NAME
+
+
+		# choose a hostname, default is the container name
+		read -p "What hostname do you wish for this container ? " -ei "$UTSNAME" UTSNAME
+
+
+		# choose an ipv4 address, better to choose the same network than
+		# your host
+		read -p "What IP address do you wish for this container (enter 'dhcp' to use DHCP) ? " -ei "$IPV4" IPV4
+
+
+		# choose the gateway ip address
+		if [ "${IPV4}" != "dhcp" ]; then
+			read -p "What is the gateway IP address ? " -ei "$GATEWAY" GATEWAY
+
+		fi
+
+		# Type guest root password
+		read -s -p "Type guest root password (enter for none/use already defined): "
+		if [[ -n "$REPLY" ]]; then
+			GUESTROOTPASS="$REPLY"
+		fi
+		printf "\n" # \n eaten by noecho
+
+		if [[ -z "${STAGE3_TARBALL}" ]]; then
+			# choose the architecture
+			read -p "Which gentoo architecture should we use in this container? " -ei "$ARCH" ARCH
+
+			# choose architecture variant
+			read -p "Architecture variant (usually '', 'hardened' or 'hardened+nomultilib')? " -ei "$ARCHVARIANT" ARCHVARIANT
+
+			LXC_ARCH="x86_64"
+			# if x86 is given prompt for "subarch"
+			if [ "${ARCH}" == 'x86' ]; then
+				read -p "Sub architecture of x86 ? " -ei "$SUBARCH" SUBARCH
+				LXC_ARCH="${SUBARCH}"
+			elif [ "${ARCH}" == "amd64" ]; then
+				SUBARCH=${ARCH}
+			fi
+
+			# choose the mirror
+			read -p "Which mirror to use for stage3 and Portage archive ? " -ei "$MIRROR" MIRROR
+		fi
+		CONFFILE="${UTSNAME}.conf"
+		echo -e "Thanks! Now sit back and relax while your gentoo brews...\n\n"
+		# nice pondering material
+		if which fortune > /dev/null 2>&1 ; then
+			echo '-----------------------------------------------------------------'
+			if which cowsay > /dev/null 2>&1 ; then
+				cowsay `fortune -s`
+			else
+				fortune
+			fi
+			echo -e "-----------------------------------------------------------------\n"
+		fi
+	fi
+
+}
+
+create()
+{
+	configure
+
+	# never hurts to have a fail-safe.
+	[[ -n "${NAME//\/}" ]] \
+		|| die 8 "\$NAME (%s) IS EMPTY OR MADE OF ONLY DIRECTORY SEPERATORS, THIS IS *VERY* BAD!\n" "$NAME"
+
+	# the rootfs name will be built with the container name
+	ROOTFS="${LXCROOT}/${NAME}/rootfs"
+
+	# check if the conffile already exists
+	[[ -e "$CONFFILE" ]] && die 18 "Error: config file (%s) already exists!\n" "$CONFFILE"
+
+	# check if the rootfs already exists
+	[[ -e "$ROOTFS" ]] && die 18 "Error: \$ROOTFS (%s) already exists!" "$ROOTFS"
+	
+	if [[ -z "$STAGE3_TARBALL" ]]; then
+		# Fetch us a stage3
+		execute_exclusively "${ARCH}_${SUBARCH}_${ARCHVARIANT}_rootfs" fetch_stage3
+		if [[ $? -ne 0 ]]; then
+			printf "ERROR: Failed to fetch stage3.\n"
+			return 1
+		fi
+	fi
+
+	# variable is nonzero, try to unpack
+	printf "Unpacking filesystem from %s to %s ... " "$STAGE3_TARBALL" "$ROOTFS"
+	mkdir -p "$ROOTFS"
+
+	# also exclude redundant .keep files
+	tar --exclude .keep -xpf "$STAGE3_TARBALL" -C "$ROOTFS"
+	if [[ $? -ne 0 ]]; then
+		printf "FAILED.\n"
+		return 1
+	else
+		printf "done.\n"
+	fi
+
+	setup_portage
+
+	write_lxc_configuration \
+		|| die 1 "Error: Failed to write LXC configuration.\n"
+
+	write_distro_inittab \
+		|| die 1 "Error: Failed to write changes to inittab.\n"
+
+	write_distro_hostname \
+		|| die 1 "Error: Failed to write hostname.\n"
+
+	populate_dev
+
+	write_distro_fstab \
+		|| die 1 "Error: Failed to write fstab\n"
+
+	write_distro_timezone \
+		|| die 1 "Error: Failed to write timezone\n"
+
+	write_distro_network \
+		|| die 1 "Error: Failed to write network configuration\n"
+
+	write_distro_init_fixes \
+		|| die 1 "Error: Failed to write init fixes\n"
+
+	set_guest_root_password \
+		|| die 1 "Error: Failed to set guest root password\n"
+
+	cat <<-EOF
+	All done!
+
+	You can run your container with the 'lxc-start -f ${CONFFILE} -n ${NAME}'
+	For host-side networking setup info, see ${ROOTFS}/etc/conf.d/net
+
+	To enter your container for setup WITHOUT running it, try:
+	 # mount -t proc proc ${ROOTFS}/proc
+	 # mount -o bind /dev ${ROOTFS}/dev
+	 # chroot ${ROOTFS} /bin/bash
+	 # export PS1="(${NAME}) \$PS1"
+	 (${NAME}) #   <-- you are now in the guest
+	... or, start it on the current console with:
+	    'lxc-start -f ${CONFFILE} -n ${NAME}'
+	... or, start it elsewhere then use 'lxc-console -n ${NAME}' for a shell
+	
+	(Report bugs to https://github.com/globalcitizen/lxc-gentoo/issues )";
+	EOF
+}
+
+destroy()
+{
+	printf "To destroy the container, just remove <container_name>* wherever you created it.\n"
+	printf "Are you sure it is not running at the moment? (use lxc-kill -n <container_name> to stop/kill it.\n"
+}
+
+help()
+{
+	cat <<-EOF
+	Usage: $0 {create|help} [options]
+		-q : Quiet, use vars from env or options and do not ask me.
+		-i XX.XX.XX.XX/XX | dhcp : IP/MASK of the container or 'dhcp' if you wish to get an IP from a dhcp server
+			Env. Var.: IPV4
+			Current/Default: ${IPV4}
+		-I HOST INTERFACE | Name of the interface to be brought up on the host
+			Env. Var.: HOSTIF
+			Current/Default: ${HOSTIF}
+		-g GATEWAY : IP address of its gateway
+			Env. Var.: GATEWAY
+			Current/Default: ${GATEWAY}
+		-n NAME : name of the container
+			Env. Var.: NAME
+			Current/Default: ${NAME}
+		-u UTSNAME : hostname of the container
+			Env. Var.: UTSNAME
+			Current/Default: ${UTSNAME}
+		-l LXCROOT : Directory to store the folder for the container
+			Env. Var.: LXCROOT
+			Current/Default: ${LXCROOT}
+		-c CONFFILE : config file location for this container
+			Env. Var.: CONFFILE
+			Current/Default: ${LXCROOT}/${NAME}/config
+		-a ARCHITECTURE : for now x86 or amd64
+			Env. Var.: ARCH
+			Current/Default: ${ARCH}
+		-s SUBARCH : subarch for x86
+			Env. Var.: SUBARCH
+			Current/Default: ${SUBARCH}
+		-p GUESTROOTPASS : password for root account
+			Env. Var.: GUESTROOTPASS
+			Current/Default: ${GUESTROOTPASS}
+		-m MIRROR : mirror for stage3 and Portage archive
+			Env. Var.: MIRROR
+			Current/Default: ${MIRROR}
+		-t STAGE3_TARBALL : path to a stage3 archive to use
+			specifiying this option will override fetching and asking you for arch, variant and mirror
+			Env. Var.: STAGE3_TARBALL
+			Cyrrent: ${STAGE3_TARBALL} Default: null
+		-P PORTAGE_SOURCE : path to a custom portage to use. Can be one of:
+			 - tarball -- will be extracted
+			 - directory -- will be bind-mounted read-only
+			 - "none" -- do not set up a portage tree
+			A portage snapshot will be downloaded if not specified
+			Env. Var.: PORTAGE_SOURCE
+			Current: "$PORTAGE_SOURCE" Default: ""
+		-C CUSTOMURL : URL for a custom tarball
+			Env. Var.: CUSTOMURL
+			Current/Default: ${CUSTOMURL}
+
+	This script is a helper to create Gentoo system containers.
+
+	To make a container, simply run:
+
+	lxc-gentoo create
+
+	You can override default by environnement variables or commandline options with this override sequence :
+	default, env, cmdline option
+
+	Example :
+	$ GATEWAY=10.0.0.254 ./lxc-gentoo create -i 10.0.0.1/24 -n gentooserver -u gentooserver
+
+	An interactive script will ask you for various information.
+
+	The first creation will download a Gentoo stage3 and portage
+	snapshot and store it into a cache at ${CACHE}.
+
+	If you wish to remove the cache, point your file manager/shell into
+	"$CACHE" and remove the files you consider unneeded.
+	If you wish to update, remove the files that you consider unneeded,
+	next lxc-gentoo create run will re-download needed ones.
+
+	To destroy the container, just remove <container_name>* wherever you created it.
+	Are you sure it is not running at the moment? (use lxc-stop/kill -n <container_name> to stop/kill it.
+
+	Have fun :)
+
+	(PS: Unix hackers with a conscience do not work for morally corrupt
+		corporations or governments. Use your powers for good!)
+	EOF
+}
+
+purge()
+{
+	cat <<- EOF
+	If you wish to remove the cache, point your file manager/shell into
+	"$CACHE" and remove the files you consider unneeded.
+	If you wish to update, remove the files that you consider unneeded,
+	next lxc-gentoo create run will re-download needed ones.
+	EOF
+}
+
+fetch()
+{
+	configure
+	# download
+	execute_exclusively "${ARCH}_${SUBARCH}_${ARCHVARIANT}_rootfs" fetch_stage3
+	execute_exclusively "portage" fetch_portage
+}
+
+# Note: assuming uid==0 is root -- might break with userns??
+if [ "$(id -u)" != "0" ]; then
+	echo "This script should be run as 'root'"
+	exit 1
+fi
+
+OPTIND=2
+while getopts "i:g:n:u:a:C:p:m:t:P:qI:c:l:" opt; do
+	case $opt in
+		i) IPV4=$OPTARG ;;
+		I) HOSTIF=$OPTARG ;; 
+		c) CONFFILE=$OPTARG ;;	
+		g) GATEWAY=$OPTARG ;;
+		n) NAME=$OPTARG ;;
+		u) UTSNAME=$OPTARG ;;
+		a) ARCH=$OPTARG ;;
+		C) CUSTOMURL=$OPTARG;;
+		p) GUESTROOTPASS=$OPTARG ;;
+		m) MIRROR=$OPTARG ;;
+		t) STAGE3_TARBALL="$OPTARG" ;;
+		P) PORTAGE_SOURCE="$OPTARG" ;;
+		l) LXCROOT="$OPTARG" ;;
+		q) QUIET=Yes ;;
+		\?) ;;
+	esac
+done
+
+case "$1" in
+	create)
+		create;;
+	destroy)
+		destroy
+		die 16 "destroy is to be removed\n" ;;
+	fetch)
+		fetch;;
+	help)
+		help;;
+	purge)
+		purge
+		die 16 "purge is to be removed\n" ;;
+	*)
+		help
+		exit 1;;
+esac
+
